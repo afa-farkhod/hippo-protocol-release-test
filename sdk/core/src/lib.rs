@@ -1,0 +1,339 @@
+#[cfg(test)]
+mod tests;
+mod types;
+use std::str::FromStr;
+
+use aes_gcm::{
+    aead::{Aead, AeadCore, OsRng as AesRng},
+    Aes256Gcm, Key, KeyInit, Nonce,
+};
+use secp256k1_zkp::{
+    ecdh, rand::rngs::OsRng as Secp256k1Rng, verify_commitments_sum_to_equal, Generator, Message,
+    PedersenCommitment, PublicKey, Secp256k1, SecretKey,
+};
+use secp256k1_zkp::{ecdsa::Signature, Tweak};
+use secp256k1_zkp::{
+    hashes::{sha256, Hash},
+    Tag,
+};
+use wasm_bindgen::prelude::*;
+
+use types::{AesEncryptedData, Commitment, Did, EncodingType, EncryptedData, KeyPair};
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+use crate::types::{AesEncryptedDataBytes, EncryptedDataBytes};
+
+#[wasm_bindgen]
+pub fn create_keypair() -> KeyPair {
+    let secp = Secp256k1::new();
+    let (secret_key, public_key) = secp.generate_keypair(&mut Secp256k1Rng);
+    KeyPair::new(
+        public_key.to_string(),
+        secret_key.display_secret().to_string(),
+    )
+}
+
+#[wasm_bindgen]
+pub fn key_to_did(pubkey: String) -> Did {
+    Did::new("did:hp:".to_owned() + &pubkey)
+}
+
+#[wasm_bindgen]
+pub fn did_to_key(did: Did) -> Result<String, JsError> {
+    did.id()
+        .strip_prefix("did:hp:")
+        .map(|s| s.to_string())
+        .ok_or_else(|| JsError::new("Invalid DID format: missing did:hp: prefix"))
+}
+
+#[wasm_bindgen]
+pub fn encrypt(
+    data: String,
+    pubkey: String,
+    encoding_type: EncodingType,
+) -> Result<EncryptedData, JsError> {
+    let secp = Secp256k1::new();
+    // Alice: one-off key pair to caculate shared secret.
+    let (secret_key, public_key) = secp.generate_keypair(&mut Secp256k1Rng);
+    // Bob: param pubkey is the one who's able to decrypt the data.
+    let encrypt_to_pubkey = secp256k1_zkp::PublicKey::from_str(&pubkey)
+        .map_err(|e| JsError::new(&format!("Invalid public key: {}", e)))?;
+    // Only Alice and Bob can know the secret, which is used as a key to encrypt data.
+    let shared_secret = ecdh::SharedSecret::new(&encrypt_to_pubkey, &secret_key).secret_bytes();
+
+    let aes_encrypted_data = encrypt_aes(data, hex::encode(&shared_secret), encoding_type)?;
+
+    Ok(EncryptedData::new(
+        public_key.to_string(),
+        pubkey,
+        aes_encrypted_data.data(),
+        aes_encrypted_data.nonce(),
+    ))
+}
+
+#[wasm_bindgen]
+pub fn decrypt(
+    data: EncryptedData,
+    privkey: String,
+    encoding_type: EncodingType,
+) -> Result<String, JsError> {
+    // Alice: one-off pubkey to calculate shared secret.
+    let encrypt_from_pubkey = secp256k1_zkp::PublicKey::from_str(&data.pubkey_from())
+        .map_err(|e| JsError::new(&format!("Invalid public key in data: {}", e)))?;
+    // Bob: the one who's able to decrypt the data with privkey.
+    let privkey_to_decrypt = secp256k1_zkp::SecretKey::from_str(&privkey)
+        .map_err(|e| JsError::new(&format!("Invalid private key: {}", e)))?;
+    // Only Alice and Bob can know the secret, which is used as a key to encrypt data.
+    let shared_secret =
+        ecdh::SharedSecret::new(&encrypt_from_pubkey, &privkey_to_decrypt).secret_bytes();
+
+    decrypt_aes(
+        AesEncryptedData::new(data.data(), data.nonce()),
+        hex::encode(&shared_secret),
+        encoding_type,
+    )
+}
+
+#[wasm_bindgen]
+pub fn encrypt_aes(
+    data: String,
+    key: String,
+    encoding_type: EncodingType,
+) -> Result<AesEncryptedData, JsError> {
+    // Secret key just fit into AES key
+    let hex_key =
+        hex::decode(key).map_err(|e| JsError::new(&format!("Key is malformed: {}", e)))?;
+    let aes_key = Key::<Aes256Gcm>::from_slice(&hex_key);
+    let cipher = Aes256Gcm::new(&aes_key);
+    // Nonce must be random and non-reusable value
+    let nonce = Aes256Gcm::generate_nonce(&mut AesRng); // 96-bits; unique per message
+    let data_bytes_vec;
+    let data_bytes: &[u8] = match encoding_type {
+        EncodingType::UTF8 => data.as_bytes(),
+        EncodingType::HEX => {
+            data_bytes_vec = hex::decode(data)
+                .map_err(|e| JsError::new(&format!("Wrong hex format data: {}", e)))?;
+            &data_bytes_vec
+        }
+        EncodingType::BASE64 => {
+            data_bytes_vec = STANDARD
+                .decode(data)
+                .map_err(|e| JsError::new(&format!("Wrong base64 format data: {}", e)))?;
+            &data_bytes_vec
+        }
+    };
+    let ciphertext = cipher
+        .encrypt(&nonce, data_bytes)
+        .map_err(|e| JsError::new(&format!("AES encryption failed: {}", e)))?;
+    Ok(AesEncryptedData::new(
+        hex::encode(&ciphertext),
+        hex::encode(&nonce),
+    ))
+}
+#[wasm_bindgen]
+pub fn decrypt_aes(
+    data: AesEncryptedData,
+    key: String,
+    encoding_type: EncodingType,
+) -> Result<String, JsError> {
+    // Secret key just fit into AES key
+    let hex_key =
+        hex::decode(key).map_err(|e| JsError::new(&format!("Key is malformed: {}", e)))?;
+    let aes_key = Key::<Aes256Gcm>::from_slice(&hex_key);
+    let decipher = Aes256Gcm::new(&aes_key);
+    // Nonce hex to bytes
+    let nonce_bytes =
+        hex::decode(&data.nonce()).map_err(|e| JsError::new(&format!("Invalid nonce: {}", e)))?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    // Data hex to bytes
+    let data_bytes =
+        hex::decode(&data.data()).map_err(|e| JsError::new(&format!("Invalid data: {}", e)))?;
+    let decrypted_data = decipher
+        .decrypt(&nonce, data_bytes.as_slice())
+        .map_err(|e| JsError::new(&format!("AES decryption failed: {}", e)))?;
+
+    match encoding_type {
+        EncodingType::UTF8 => String::from_utf8(decrypted_data)
+            .map_err(|e| JsError::new(&format!("Wrong utf8 format data: {}", e))),
+        EncodingType::HEX => Ok(hex::encode(decrypted_data)),
+        EncodingType::BASE64 => Ok(STANDARD.encode(decrypted_data)),
+    }
+}
+
+#[wasm_bindgen]
+pub fn sign(data: String, privkey: String) -> Result<String, JsError> {
+    let secp = Secp256k1::new();
+    let digest = sha256::Hash::hash(data.as_bytes());
+    let message = Message::from_digest(digest.to_byte_array());
+    let secret_key = SecretKey::from_str(&privkey)
+        .map_err(|e| JsError::new(&format!("Invalid private key: {}", e)))?;
+
+    Ok(secp.sign_ecdsa(&message, &secret_key).to_string())
+}
+#[wasm_bindgen]
+pub fn verify(data: String, sig: String, pubkey: String) -> Result<bool, JsError> {
+    let secp = Secp256k1::new();
+    let digest = sha256::Hash::hash(data.as_bytes());
+    let message = Message::from_digest(digest.to_byte_array());
+    let signature = Signature::from_str(&sig)
+        .map_err(|e| JsError::new(&format!("Invalid signature: {}", e)))?;
+    let public_key = PublicKey::from_str(&pubkey)
+        .map_err(|e| JsError::new(&format!("Invalid public key: {}", e)))?;
+
+    match secp.verify_ecdsa(&message, &signature, &public_key) {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+#[wasm_bindgen]
+pub fn sha256(data: String) -> String {
+    sha256::Hash::hash(data.as_bytes()).to_string()
+}
+#[wasm_bindgen]
+pub fn ecdh(privkey: String, pubkey: String) -> Result<String, JsError> {
+    // Alice: param privkey is the one who's able to decrypt the data.
+    let alice = secp256k1_zkp::SecretKey::from_str(&privkey)
+        .map_err(|e| JsError::new(&format!("Invalid private key: {}", e)))?;
+    // Bob: param pubkey is the one who's able to decrypt the data.
+    let bob = secp256k1_zkp::PublicKey::from_str(&pubkey)
+        .map_err(|e| JsError::new(&format!("Invalid public key: {}", e)))?;
+    // Only Alice and Bob can know the secret, which is used as a key to sign or encrypt data(or any other).
+    let shared_secret = ecdh::SharedSecret::new(&bob, &alice);
+    Ok(shared_secret.display_secret().to_string())
+}
+// Pederson commitment is building block for zkp.
+// commitment is additively homomorphic.
+// blinding_factor must be kept as secret, to prevent the confidentiality of the committed value.
+// Tag is for domain(or purpose) separation.
+#[wasm_bindgen]
+pub fn pedersen_commit(value: u64, tag: String) -> Commitment {
+    let secp = Secp256k1::new();
+    let blinding_factor = Tweak::new(&mut Secp256k1Rng);
+    let tag = Tag::from(sha256::Hash::hash(tag.as_bytes()).to_byte_array());
+    Commitment::new(
+        PedersenCommitment::new(
+            &secp,
+            value,
+            blinding_factor,
+            // Blinded Generator is used in MimbleWimble for
+            // 1. Unlinkability: G' unique to a specific transaction, any commitments using it not linked to commitments from other transactions.
+            // 2. Proof of Ownership: the sum of all blinding factors in a transaction must equal a public key.
+            // Original pedersen: C=v⋅G+r⋅H
+            // Blinded Generator pedersen: C=v⋅G'+r⋅H (where G' = G+g⋅H, g is distinct blinding factor).
+            // Here, not using Blinded Generator as we only care the confidentiality of value.
+            Generator::new_unblinded(&secp, tag),
+        )
+        .to_string(),
+        blinding_factor.to_string(),
+    )
+}
+// Perderson verify by revealing value.
+#[wasm_bindgen]
+pub fn pedersen_reveal(commitment: Commitment, value: u64, tag: String) -> Result<bool, JsError> {
+    let secp = Secp256k1::new();
+    let blinding_factor = Tweak::from_str(&commitment.secret_blinding_factor())
+        .map_err(|e| JsError::new(&format!("Wrong blinding factor: {}", e)))?;
+    let tag = Tag::from(sha256::Hash::hash(tag.as_bytes()).to_byte_array());
+
+    let commitment_obj = PedersenCommitment::from_str(&commitment.commitment())
+        .map_err(|e| JsError::new(&format!("Wrong commitment: {}", e)))?;
+
+    Ok(verify_commitments_sum_to_equal(
+        &secp,
+        &vec![PedersenCommitment::new(
+            &secp,
+            value,
+            blinding_factor,
+            // Blinded Generator is used in MimbleWimble for
+            // 1. Unlinkability: G' unique to a specific transaction, any commitments using it not linked to commitments from other transactions.
+            // 2. Proof of Ownership: the sum of all blinding factors in a transaction must equal a public key
+            // Original pedersen: C=v⋅G+r⋅H
+            // Blinded Generator pedersen: C=v⋅G'+r⋅H (where G' = G+g⋅H, g is distinct blinding factor)
+            // Here, not using Blinded Generator as we only care the confidentiality of value
+            Generator::new_unblinded(&secp, tag),
+        )],
+        &vec![commitment_obj],
+    ))
+}
+
+#[wasm_bindgen]
+pub fn sha256_bytes(data: Vec<u8>) -> Vec<u8> {
+    sha256::Hash::hash(&data).to_byte_array().to_vec()
+}
+
+#[wasm_bindgen]
+pub fn encrypt_bytes(data: Vec<u8>, pubkey: String) -> Result<EncryptedDataBytes, JsError> {
+    let secp = Secp256k1::new();
+    // Alice: one-off key pair to caculate shared secret.
+    let (secret_key, public_key) = secp.generate_keypair(&mut Secp256k1Rng);
+    // Bob: param pubkey is the one who's able to decrypt the data.
+    let encrypt_to_pubkey = secp256k1_zkp::PublicKey::from_str(&pubkey)
+        .map_err(|e| JsError::new(&format!("Invalid public key: {}", e)))?;
+    // Only Alice and Bob can know the secret, which is used as a key to encrypt data.
+    let shared_secret = ecdh::SharedSecret::new(&encrypt_to_pubkey, &secret_key).secret_bytes();
+
+    let aes_encrypted_data = encrypt_aes_bytes(data, hex::encode(&shared_secret))?;
+
+    Ok(EncryptedDataBytes::new(
+        public_key.to_string(),
+        pubkey,
+        aes_encrypted_data.data(),
+        aes_encrypted_data.nonce(),
+    ))
+}
+
+#[wasm_bindgen]
+pub fn decrypt_bytes(data: EncryptedDataBytes, privkey: String) -> Result<Vec<u8>, JsError> {
+    // Alice: one-off pubkey to calculate shared secret.
+    let encrypt_from_pubkey = secp256k1_zkp::PublicKey::from_str(&data.pubkey_from())
+        .map_err(|e| JsError::new(&format!("Invalid public key in data: {}", e)))?;
+    // Bob: the one who's able to decrypt the data with privkey.
+    let privkey_to_decrypt = secp256k1_zkp::SecretKey::from_str(&privkey)
+        .map_err(|e| JsError::new(&format!("Invalid private key: {}", e)))?;
+    // Only Alice and Bob can know the secret, which is used as a key to encrypt data.
+    let shared_secret =
+        ecdh::SharedSecret::new(&encrypt_from_pubkey, &privkey_to_decrypt).secret_bytes();
+
+    decrypt_aes_bytes(
+        AesEncryptedDataBytes::new(data.data(), data.nonce()),
+        hex::encode(&shared_secret),
+    )
+}
+
+#[wasm_bindgen]
+pub fn encrypt_aes_bytes(data: Vec<u8>, key: String) -> Result<AesEncryptedDataBytes, JsError> {
+    // Secret key just fit into AES key
+    let hex_key =
+        hex::decode(key).map_err(|e| JsError::new(&format!("Key is malformed: {}", e)))?;
+    let aes_key = Key::<Aes256Gcm>::from_slice(&hex_key);
+    let cipher = Aes256Gcm::new(&aes_key);
+    // Nonce must be random and non-reusable value
+    let nonce = Aes256Gcm::generate_nonce(&mut AesRng); // 96-bits; unique per message
+
+    let ciphertext = cipher
+        .encrypt(&nonce, &*data)
+        .map_err(|e| JsError::new(&format!("AES encryption failed: {}", e)))?;
+    Ok(AesEncryptedDataBytes::new(ciphertext, nonce.to_vec()))
+}
+#[wasm_bindgen]
+pub fn decrypt_aes_bytes(data: AesEncryptedDataBytes, key: String) -> Result<Vec<u8>, JsError> {
+    // Secret key just fit into AES key
+    let hex_key =
+        hex::decode(key).map_err(|e| JsError::new(&format!("Key is malformed: {}", e)))?;
+    let aes_key = Key::<Aes256Gcm>::from_slice(&hex_key);
+    let decipher = Aes256Gcm::new(&aes_key);
+
+    decipher
+        .decrypt(
+            Nonce::from_slice(data.nonce().as_slice()),
+            data.data().as_slice(),
+        )
+        .map_err(|e| JsError::new(&format!("AES decryption failed: {}", e)))
+}
+
+#[wasm_bindgen(start)]
+pub fn init_panic_hook() -> Result<(), JsValue> {
+    console_error_panic_hook::set_once();
+    Ok(())
+}

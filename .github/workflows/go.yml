@@ -1,0 +1,95 @@
+# This workflow will build a golang project
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
+
+name: Go
+
+on:
+  push:
+    branches: ["main", "feature/cosmwasm"]
+  pull_request:
+    branches: ["main", "feature/cosmwasm"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.24"
+
+      - name: Build
+        run: make build
+
+  test-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.24"
+
+      - name: Test
+        run: |
+          PKGS=$(go list ./... | grep -v "/test/e2e" | tr '\n' ',' | sed 's/,$//')
+          go test -coverpkg=$PKGS -v $(go list ./... | grep -v "/test/e2e")
+          go test -coverpkg=$PKGS -coverprofile=cover.out $(go list ./... | grep -v "/test/e2e")
+          go tool cover -func=cover.out
+
+          coverage=$(go tool cover -func=cover.out | awk '/total:/ {print $3}' | sed 's/%//' | awk '{print $1}')
+          threshold=75
+
+          if [[ -z "$coverage" ]]; then
+          echo "Error:Could not extract coverage percentage."
+          exit 1
+          fi
+
+          if (( $(echo $(printf "%.0f" "$coverage") ) < $threshold )); then
+          echo "Error:Coverage is below threshold ($coverage% < $threshold%)"
+          exit 1
+
+          else
+          echo "Coverage is $coverage%, which meets the threshold ($threshold%)"
+          fi
+
+  e2e-genesis-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.24"
+
+      - name: Genesis Node Start
+        run: |
+          go run hippod/main.go init hippo --chain-id hippo-protocol-testnet-1
+          echo -e "password\npassword" | go run hippod/main.go keys add alice --keyring-backend file
+          echo -e "password" | go run hippod/main.go genesis add-genesis-account alice 1084734273380000000000000000ahp --keyring-backend file
+          echo -e "password" | go run hippod/main.go genesis gentx alice 1000000000000000000ahp --chain-id hippo-protocol-testnet-1 --keyring-backend file
+          go run hippod/main.go genesis collect-gentxs
+          sed -i '/\[api\]/{ N;N;N; s/enable = false/enable = true/; }' ~/.hippo/config/app.toml
+          go run hippod/main.go start &
+          while ! nc -z localhost 26657; do
+            echo "Waiting for node to start..."
+            sleep 1
+          done
+
+          echo "Port open. Waiting 30s for chain initialization and CosmWasm module setup..."
+          sleep 30
+
+          echo "Node started. Chain is running at v2.0.0 with CosmWasm support. Ready for tests."
+
+      - name: Run Command Test # Ensure all the commands pass.
+        run: |
+          go test ./test/e2e -v
+
+      - name: Cleanup - Stop Node
+        if: always() # Ensure cleanup runs even if tests fail.
+        run: |
+          pkill -f "go run hippod/main.go start"
